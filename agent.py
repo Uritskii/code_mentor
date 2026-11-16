@@ -4,8 +4,7 @@ import re
 from providers import get_client_and_model
 from tools import execute_tool, tool_schemas, register_submitted_code
 
-# Системный промпт: роль и правила. Помним: правило в промпте — просьба,
-# гарантии даёт только код (эталонные ответы модели недоступны физически).
+
 SYSTEM_PROMPT = """Ты — наставник по программированию для начинающего студента.
 
 Правила:
@@ -22,10 +21,22 @@ SYSTEM_PROMPT = """Ты — наставник по программирован
 7. Отвечай кратко, по-русски, дружелюбно."""
 
 
+def _confirm_action(name: str, args) -> bool:
+    """Подтверждение действия человеком.
+    Harness показывает студенту конкретные параметры действия и выполняет
+    ровно их — и только после «да». Фраза модели «студент согласен»
+    подтверждением не считается.
+    """
+    print(f"\n[требуется подтверждение] Наставник хочет выполнить действие:")
+    print(f"  инструмент: {name}")
+    print(f"  параметры:  {args.model_dump()}")
+    answer = input("Подтвердить? [да/нет] ")
+    return answer.strip().lower() in {"да", "д", "yes", "y"}
+
+
 def run_agent(user_message: str, history: list | None = None, max_steps: int = 6) -> str:
     """Один диалоговый ход: цикл до финального ответа или лимита шагов."""
     # Harness извлекает блоки кода из сообщения студента и фиксирует их:
-    # только этот код разрешено запускать в run_tests (страж в tools.py)
     for block in re.findall(r"```(?:python)?\s*\n(.*?)```", user_message, re.DOTALL):
         register_submitted_code(block)
 
@@ -35,13 +46,11 @@ def run_agent(user_message: str, history: list | None = None, max_steps: int = 6
     messages.append({"role": "user", "content": user_message})
 
     for step in range(1, max_steps + 1):
-        # рассуждение: весь контекст + схемы инструментов -> модель
         resp = client.chat.completions.create(
             model=model, messages=messages,
             tools=tool_schemas(), tool_choice="auto",
         )
         msg = resp.choices[0].message
-        # кладём сообщение ассистента в историю как есть (вместе с tool_calls)
         messages.append(msg.model_dump(exclude_none=True))
 
         # выход 1: инструменты не нужны — это финальный ответ студенту
@@ -63,7 +72,7 @@ def run_agent(user_message: str, history: list | None = None, max_steps: int = 6
                 args = json.loads(call.function.arguments)
             except json.JSONDecodeError:
                 args = {}  # пусть валидация вернёт модели понятную ошибку
-            result = execute_tool(call.function.name, args)
+            result = execute_tool(call.function.name, args, confirm=_confirm_action)
             messages.append({
                 "role": "tool", "tool_call_id": call.id,
                 "content": json.dumps(result, ensure_ascii=False),
