@@ -1,83 +1,221 @@
 import json
-import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Literal, Optional
 
-from providers import get_client_and_model
-from tools import execute_tool, tool_schemas, register_submitted_code
+from pydantic import BaseModel, Field, ValidationError
 
-
-SYSTEM_PROMPT = """Ты — наставник по программированию для начинающего студента.
-
-Правила:
-1. Никогда не пиши за студента готовое решение и не показывай исправленный код целиком.
-2. Веди к решению ступенчатыми подсказками:
-   - Уровень 1 (первая ошибка): назови область и характер ошибки СВОИМИ СЛОВАМИ. ЗАПРЕЩЕНО приводить правильное условие, выражение, оператор или фрагмент исправленного кода.
-   - Уровень 2 (студент не справился): опиши идею исправления словами, всё ещё без кода.
-   - Уровень 3 (несколько неудачных попыток): можно показать фрагмент с исправлением.
-   Пример уровня 1. ПЛОХО: «замени x % 2 == 1 на x % 2 == 0». ХОРОШО: «твой фильтр отбирает не ту группу чисел — перечитай условие задачи и подумай, остаток от деления на 2 у каких чисел нужно считать».
-3. Когда студент присылает код, всегда проверяй его инструментом run_tests, не гадай. Проверять можно ТОЛЬКО код, который прислал студент; свой вариант решения запускать запрещено.
-4. Опирайся на условие задачи — при необходимости возьми его через get_task.
-5. Когда ошибка точно установлена и разобрана, запиши её через record_mistake.
-6. Тесты скрыты: эталонных ответов у тебя нет, не выдумывай их.
-7. Отвечай кратко, по-русски, дружелюбно."""
+# Каталог задач и файл профиля студента лежат рядом со скриптом
+BASE_DIR = Path(__file__).parent
+TASKS = {t["id"]: t for t in json.loads((BASE_DIR / "tasks.json").read_text(encoding="utf-8"))}
+PROFILE_PATH = BASE_DIR / "student_profile.json"
 
 
-def _confirm_action(name: str, args) -> bool:
-    """Подтверждение действия человеком.
-    Harness показывает студенту конкретные параметры действия и выполняет
-    ровно их — и только после «да». Фраза модели «студент согласен»
-    подтверждением не считается.
+_SUBMITTED_CODE: set[str] = set()
+
+
+def register_submitted_code(code: str) -> None:
+    """Вызывает harness: фиксирует код из сообщения студента."""
+    _SUBMITTED_CODE.add(code.strip())
+
+
+class ToolError(Exception):
+    """Ожидаемая ошибка инструмента — уйдёт модели как данные, а не как traceback."""
+
+
+# ---------------------------------------------------------------- схемы аргументов
+
+class GetTaskArgs(BaseModel):
+    task_id: Literal["sum_two", "count_even", "max_of_three"] = Field(
+        description="Идентификатор задачи из каталога"
+    )
+
+
+class RunTestsArgs(BaseModel):
+    task_id: Literal["sum_two", "count_even", "max_of_three"] = Field(
+        description="Идентификатор задачи, к которой относится код"
+    )
+    code: str = Field(
+        description="Полный текст решения студента на Python. "
+                    "Программа читает входные данные из stdin и печатает ответ.",
+        max_length=10_000,
+    )
+
+
+class RecordMistakeArgs(BaseModel):
+    task_id: str = Field(description="Задача, в которой ошибся студент")
+    category: Literal[
+        "input_parsing",   # неверно прочитал входные данные
+        "boundary",        # граничные случаи: ноль, пустой ввод, отрицательные
+        "off_by_one",      # ошибка на единицу в циклах/индексах
+        "logic",           # неверная логика решения
+        "output_format",   # формат вывода не совпадает с требуемым
+    ] = Field(description="Категория ошибки — строго из списка")
+    note: str = Field(description="Одно предложение: в чём именно ошибка", max_length=300)
+
+
+# ---------------------------------------------------------------- реализация
+
+def get_task(args: GetTaskArgs) -> dict:
+    """Возвращает условие задачи. Тесты намеренно не отдаются —
+    модель не должна видеть эталонные ответы."""
+    task = TASKS.get(args.task_id)
+    if task is None:
+        raise ToolError(f"Задача '{args.task_id}' не найдена. Есть: {list(TASKS)}")
+    return {"task_id": task["id"], "title": task["title"], "statement": task["statement"]}
+
+
+def run_tests(args: RunTestsArgs) -> dict:
+    """Запускает код студента на тестах задачи в отдельном процессе с таймаутом.
+
+    Возвращает агрегированный результат: сколько тестов пройдено, тип первой
+    ошибки и вывод студента на упавшем тесте. Эталонный ответ НЕ возвращается —
+    это защита от утечки решения через инструмент.
     """
-    print(f"\n[требуется подтверждение] Наставник хочет выполнить действие:")
-    print(f"  инструмент: {name}")
-    print(f"  параметры:  {args.model_dump()}")
-    answer = input("Подтвердить? [да/нет] ")
-    return answer.strip().lower() in {"да", "д", "yes", "y"}
-
-
-def run_agent(user_message: str, history: list | None = None, max_steps: int = 6) -> str:
-    """Один диалоговый ход: цикл до финального ответа или лимита шагов."""
-    # Harness извлекает блоки кода из сообщения студента и фиксирует их:
-    for block in re.findall(r"```(?:python)?\s*\n(.*?)```", user_message, re.DOTALL):
-        register_submitted_code(block)
-
-    client, model = get_client_and_model()
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(history or [])
-    messages.append({"role": "user", "content": user_message})
-
-    for step in range(1, max_steps + 1):
-        resp = client.chat.completions.create(
-            model=model, messages=messages,
-            tools=tool_schemas(), tool_choice="auto",
+    # Страж в коде: модель может проверять только код, присланный студентом.
+    # Свои собственные «исправленные» варианты запускать запрещено —
+    # иначе агент фабрикует успех вместо честной проверки.
+    if args.code.strip() not in _SUBMITTED_CODE:
+        raise ToolError(
+            "Этот код не присылал студент. Проверять можно только код из сообщений "
+            "студента. Если хочешь показать идею исправления — опиши её словами."
         )
-        msg = resp.choices[0].message
-        messages.append(msg.model_dump(exclude_none=True))
 
-        # выход 1: инструменты не нужны — это финальный ответ студенту
-        if not msg.tool_calls:
-            # Страж в коде: студент прислал код, а модель не проверила его
-            # тестами — ответ не отдаём, возвращаем модель в цикл с напоминанием.
-            code_sent = "```" in user_message
-            tests_ran = any(m.get("role") == "tool" for m in messages)
-            if code_sent and not tests_ran:
-                messages.append({"role": "user", "content":
-                    "[напоминание harness] Студент прислал код. Сначала проверь его "
-                    "через run_tests, потом отвечай."})
-                continue
-            return msg.content
+    task = TASKS.get(args.task_id)
+    if task is None:
+        raise ToolError(f"Задача '{args.task_id}' не найдена")
 
-        # действие и наблюдение: выполнить, результат -> в контекст
-        for call in msg.tool_calls:
-            try:
-                args = json.loads(call.function.arguments)
-            except json.JSONDecodeError:
-                args = {}  # пусть валидация вернёт модели понятную ошибку
-            result = execute_tool(call.function.name, args, confirm=_confirm_action)
-            messages.append({
-                "role": "tool", "tool_call_id": call.id,
-                "content": json.dumps(result, ensure_ascii=False),
-            })
+    passed = 0
+    first_failure = None
+    for i, test in enumerate(task["tests"], start=1):
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", args.code],
+                input=test["input"],
+                capture_output=True,
+                text=True,
+                timeout=3,  # клиент не будет ждать вечно
+            )
+        except subprocess.TimeoutExpired:
+            first_failure = {"test": i, "type": "timeout",
+                             "message": "Программа не завершилась за 3 секунды (возможен бесконечный цикл)"}
+            break
 
-    # выход 2: лимит шагов исчерпан — решение принял harness, не модель
-    return ("Я запутался в шагах и остановился, чтобы не тратить твоё время. "
-            "Давай начнём этот вопрос заново, короче.")
+        actual = proc.stdout.strip()
+        if proc.returncode != 0:
+            # stderr режем до первой строки — не тащим traceback в контекст
+            err_line = (proc.stderr.strip().splitlines() or ["unknown"])[-1]
+            first_failure = {"test": i, "type": "runtime_error", "message": err_line}
+            break
+        if actual == test["expected"].strip():
+            passed += 1
+        else:
+            # ВАЖНО: эталонный ответ сюда не кладём
+            first_failure = {"test": i, "type": "wrong_answer",
+                             "input": test["input"], "student_output": actual}
+            break
+
+    total = len(task["tests"])
+    return {
+        "passed": passed,
+        "total": total,
+        "all_passed": passed == total,
+        "first_failure": first_failure,
+    }
+
+
+def record_mistake(args: RecordMistakeArgs) -> dict:
+    """Действие: пишет ошибку в профиль студента на диске.
+
+    Идемпотентность: та же категория в той же задаче не дублируется,
+    а увеличивает счётчик — повторный вызов безопасен.
+    """
+    if args.task_id not in TASKS:
+        raise ToolError(f"Задача '{args.task_id}' не найдена")
+
+    profile = json.loads(PROFILE_PATH.read_text(encoding="utf-8")) if PROFILE_PATH.exists() else {"mistakes": []}
+    for m in profile["mistakes"]:
+        if m["task_id"] == args.task_id and m["category"] == args.category:
+            m["count"] += 1
+            m["note"] = args.note
+            break
+    else:
+        profile["mistakes"].append(
+            {"task_id": args.task_id, "category": args.category, "note": args.note, "count": 1}
+        )
+    PROFILE_PATH.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"saved": True, "total_mistakes_in_profile": len(profile["mistakes"])}
+
+
+# ---------------------------------------------------------------- реестр и harness
+
+TOOLS = {
+    "get_task": {
+        "description": "Возвращает условие учебной задачи по её id. Вызывай, когда нужно сверить решение студента с условием.",
+        "args_model": GetTaskArgs,
+        "fn": get_task,
+    },
+    "run_tests": {
+        "description": "Запускает код студента на скрытых тестах задачи и возвращает, сколько тестов пройдено и где первая ошибка. "
+                       "Эталонные ответы не раскрываются. Вызывай всегда, когда студент присылает код.",
+        "args_model": RunTestsArgs,
+        "fn": run_tests,
+    },
+    "record_mistake": {
+        "description": "Записывает ошибку студента в его долговременный профиль. "
+                       "Вызывай один раз, когда ошибка точно установлена и разобрана.",
+        "args_model": RecordMistakeArgs,
+        "fn": record_mistake,
+        # Действие с побочным эффектом: выполняется только после того,
+        # как человек подтвердил конкретные параметры (паттерн из лекции 2)
+        "requires_confirmation": True,
+    },
+}
+
+
+def tool_schemas() -> list[dict]:
+    """Схемы в формате OpenAI tools — это то, что видит модель."""
+    schemas = []
+    for name, tool in TOOLS.items():
+        schema = tool["args_model"].model_json_schema()
+        # pydantic кладёт описание полей внутрь properties — формат совместим
+        schemas.append({
+            "type": "function",
+            "function": {"name": name, "description": tool["description"], "parameters": schema},
+        })
+    return schemas
+
+
+def execute_tool(name: str, raw_args: dict, confirm=None) -> dict:
+    """Harness: проверить аргументы -> подтвердить действие -> выполнить.
+
+    Модель участвует только в выборе вызова; всё остальное делает этот код.
+    confirm — функция (name, args) -> bool, её передаёт harness для инструментов
+    с флагом requires_confirmation. Отказ возвращается модели как данные.
+    """
+    print(f"[вызов инструмента] {name}({raw_args})")  # трассировка вызовов
+    tool = TOOLS.get(name)
+    if tool is None:
+        return {"error": {"type": "unknown_tool", "message": f"Инструмента '{name}' нет",
+                          "hint": f"Доступны: {list(TOOLS)}"}}
+    try:
+        args = tool["args_model"].model_validate(raw_args)
+    except ValidationError as e:
+        # Сообщение об ошибке пишем для модели: что не так и что допустимо
+        first = e.errors()[0]
+        return {"error": {"type": "validation", "field": ".".join(map(str, first["loc"])),
+                          "message": first["msg"], "hint": "Исправь аргументы и повтори вызов"}}
+    # Действие с побочным эффектом — только после подтверждения человеком.
+    # Подтверждаются конкретные параметры, а не «намерение» модели.
+    if tool.get("requires_confirmation"):
+        if confirm is None or not confirm(name, args):
+            return {"cancelled": True,
+                    "message": "Человек не подтвердил действие. Продолжи диалог, не записывая в профиль."}
+    try:
+        return {"result": tool["fn"](args)}
+    except ToolError as e:
+        return {"error": {"type": "tool_error", "message": str(e)}}
+    except Exception as e:  # неожиданное — тоже как данные, агент не должен падать
+        return {"error": {"type": "internal", "message": f"{type(e).__name__}: {e}",
+                          "hint": "Сообщи студенту, что проверка сейчас недоступна"}}
