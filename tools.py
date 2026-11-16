@@ -1,6 +1,7 @@
 import json
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -10,6 +11,17 @@ from pydantic import BaseModel, Field, ValidationError
 BASE_DIR = Path(__file__).parent
 TASKS = {t["id"]: t for t in json.loads((BASE_DIR / "tasks.json").read_text(encoding="utf-8"))}
 PROFILE_PATH = BASE_DIR / "student_profile.json"
+# Трассировка вызовов инструментов пишется в файл (JSON Lines: одна строка — один вызов),
+# чтобы не засорять диалог в чате/ноутбуке
+TRACE_PATH = BASE_DIR / "agent_trace.log"
+
+
+def _log_tool_call(name: str, raw_args: dict) -> None:
+    """Одна запись трассы: время, инструмент, аргументы."""
+    entry = {"ts": datetime.now().isoformat(timespec="seconds"),
+             "tool": name, "args": raw_args}
+    with TRACE_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 # Реестр кода, который действительно присылал студент (заполняет harness).
@@ -169,6 +181,9 @@ TOOLS = {
                        "Вызывай один раз, когда ошибка точно установлена и разобрана.",
         "args_model": RecordMistakeArgs,
         "fn": record_mistake,
+        # Действие с побочным эффектом: выполняется только после того,
+        # как человек подтвердил конкретные параметры (паттерн из лекции 2)
+        "requires_confirmation": True,
     },
 }
 
@@ -186,12 +201,14 @@ def tool_schemas() -> list[dict]:
     return schemas
 
 
-def execute_tool(name: str, raw_args: dict) -> dict:
-    """Harness: проверить аргументы -> выполнить -> ошибку вернуть как данные.
+def execute_tool(name: str, raw_args: dict, confirm=None) -> dict:
+    """Harness: проверить аргументы -> подтвердить действие -> выполнить.
 
     Модель участвует только в выборе вызова; всё остальное делает этот код.
+    confirm — функция (name, args) -> bool, её передаёт harness для инструментов
+    с флагом requires_confirmation. Отказ возвращается модели как данные.
     """
-    print(f"[вызов инструмента] {name}({raw_args})")  # трассировка вызовов
+    _log_tool_call(name, raw_args)  # трассировка вызовов — в файл agent_trace.log
     tool = TOOLS.get(name)
     if tool is None:
         return {"error": {"type": "unknown_tool", "message": f"Инструмента '{name}' нет",
@@ -203,6 +220,12 @@ def execute_tool(name: str, raw_args: dict) -> dict:
         first = e.errors()[0]
         return {"error": {"type": "validation", "field": ".".join(map(str, first["loc"])),
                           "message": first["msg"], "hint": "Исправь аргументы и повтори вызов"}}
+    # Действие с побочным эффектом — только после подтверждения человеком.
+    # Подтверждаются конкретные параметры, а не «намерение» модели.
+    if tool.get("requires_confirmation"):
+        if confirm is None or not confirm(name, args):
+            return {"cancelled": True,
+                    "message": "Человек не подтвердил действие. Продолжи диалог, не записывая в профиль."}
     try:
         return {"result": tool["fn"](args)}
     except ToolError as e:
